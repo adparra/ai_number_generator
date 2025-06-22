@@ -1,6 +1,7 @@
-from flask import Flask, render_template, request, jsonify, send_file
+from flask import Flask, render_template, request, jsonify
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import base64
 import io
@@ -9,13 +10,14 @@ import os
 
 app = Flask(__name__)
 
-# VAE Model (same as training)
-class VAE(nn.Module):
-    def __init__(self, input_dim=784, hidden_dim=400, latent_dim=20):
-        super(VAE, self).__init__()
+class ConditionalVAE(nn.Module):
+    def __init__(self, input_dim=784, hidden_dim=512, latent_dim=16, num_classes=10):
+        super(ConditionalVAE, self).__init__()
         
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(input_dim + num_classes, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU()
@@ -25,7 +27,9 @@ class VAE(nn.Module):
         self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
         
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
+            nn.Linear(latent_dim + num_classes, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -33,95 +37,44 @@ class VAE(nn.Module):
             nn.Sigmoid()
         )
         
-    def encode(self, x):
-        h = self.encoder(x)
-        mu = self.fc_mu(h)
-        logvar = self.fc_logvar(h)
-        return mu, logvar
-    
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-    
-    def decode(self, z):
-        return self.decoder(z)
-    
-    def forward(self, x):
-        mu, logvar = self.encode(x.view(-1, 784))
-        z = self.reparameterize(mu, logvar)
-        return self.decode(z), mu, logvar
+    def decode(self, z, c):
+        return self.decoder(torch.cat([z, c], dim=1))
 
-# Load model
-device = torch.device('cpu')  # Use CPU for deployment
-model = VAE().to(device)
+device = torch.device('cpu')
+model = ConditionalVAE().to(device)
 
-# Load trained weights
 try:
-    model.load_state_dict(torch.load('vae_mnist.pth', map_location=device))
+    model.load_state_dict(torch.load('cvae_mnist.pth', map_location=device))
     model.eval()
-    print("Model loaded successfully")
-except:
-    print("Model file not found. Please upload vae_mnist.pth")
+    print("Conditional VAE loaded successfully")
+except Exception as e:
+    print(f"Model loading error: {e}")
+    model = None
 
-# Store digit prototypes for conditional generation
-digit_prototypes = {}
-
-def get_digit_prototype(digit):
-    """Get latent representation for a specific digit"""
-    if digit not in digit_prototypes:
-        # Generate random latent vectors biased toward specific patterns
-        # This is a simple approach - in practice you'd use a conditional VAE
-        np.random.seed(digit * 42)  # Consistent seed per digit
-        base_vector = np.random.randn(20) * 0.5
-        
-        # Add digit-specific bias
-        if digit == 0:
-            base_vector[0:5] = [-1, 0, 1, 0, -1]
-        elif digit == 1:
-            base_vector[0:5] = [0, 1, 1, 0, 0]
-        elif digit == 2:
-            base_vector[0:5] = [1, -1, 0, 1, -1]
-        elif digit == 3:
-            base_vector[0:5] = [1, 0, -1, 1, 0]
-        elif digit == 4:
-            base_vector[0:5] = [-1, 1, 1, -1, 0]
-        elif digit == 5:
-            base_vector[0:5] = [0, -1, 1, 0, 1]
-        elif digit == 6:
-            base_vector[0:5] = [-1, -1, 0, 1, 1]
-        elif digit == 7:
-            base_vector[0:5] = [1, 1, 0, 0, -1]
-        elif digit == 8:
-            base_vector[0:5] = [0, 0, -1, -1, 1]
-        elif digit == 9:
-            base_vector[0:5] = [1, 0, 1, -1, -1]
-        
-        digit_prototypes[digit] = base_vector
-    
-    return digit_prototypes[digit]
+def to_one_hot(digit, num_classes=10):
+    return F.one_hot(torch.tensor([digit]), num_classes=num_classes).float()
 
 def generate_digit_images(digit, num_images=5):
-    """Generate images for a specific digit"""
+    if model is None:
+        raise Exception("Model not loaded")
+        
     images = []
-    prototype = get_digit_prototype(digit)
+    one_hot = to_one_hot(digit).to(device)
     
     with torch.no_grad():
         for i in range(num_images):
-            # Add noise to prototype for variation
-            noise = np.random.randn(20) * 0.3
-            latent_vector = prototype + noise
-            latent_tensor = torch.FloatTensor(latent_vector).unsqueeze(0).to(device)
+            # Sample from standard normal
+            z = torch.randn(1, 16).to(device)
             
             # Generate image
-            generated = model.decode(latent_tensor)
+            generated = model.decode(z, one_hot)
             img_array = generated.view(28, 28).cpu().numpy()
             
             # Convert to PIL Image
             img_array = (img_array * 255).astype(np.uint8)
             img = Image.fromarray(img_array, mode='L')
             
-            # Convert to base64 for web display
+            # Convert to base64
             buffer = io.BytesIO()
             img.save(buffer, format='PNG')
             img_str = base64.b64encode(buffer.getvalue()).decode('utf-8')
@@ -136,15 +89,27 @@ def index():
 @app.route('/generate', methods=['POST'])
 def generate():
     try:
-        digit = int(request.json.get('digit', 0))
+        if request.is_json:
+            digit = int(request.json.get('digit', 0))
+        else:
+            digit = int(request.form.get('digit', 0))
+        
         if digit < 0 or digit > 9:
             return jsonify({'error': 'Digit must be between 0 and 9'}), 400
+        
+        if model is None:
+            return jsonify({'error': 'Model not loaded'}), 500
         
         images = generate_digit_images(digit)
         return jsonify({'images': images, 'digit': digit})
     
     except Exception as e:
+        print(f"Generation error: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'ok', 'model_loaded': model is not None})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
